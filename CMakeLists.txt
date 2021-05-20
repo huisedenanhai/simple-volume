@@ -1,14 +1,17 @@
 cmake_minimum_required(VERSION 3.15)
 project(SimpleVolume LANGUAGES CXX CUDA)
-set(CMAKE_CUDA_ARCHITECTURES 72)
+set(CMAKE_CUDA_ARCHITECTURES 75)
+# suppress warning from nanovdb
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -w -Xcompiler /utf-8")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
 
-add_executable(volume main.cu)
+add_executable(volume main.cpp render.cu render.h)
 target_compile_features(volume PRIVATE cxx_std_14)
 set_target_properties(volume 
   PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON)
 
-set_property(TARGET volume PROPERTY CUDA_ARCHITECTURES 72)
+set_property(TARGET volume PROPERTY CUDA_ARCHITECTURES 75)
 
 configure_file(config.h.in ${CMAKE_CURRENT_BINARY_DIR}/config.h)
 
@@ -20,6 +23,8 @@ target_include_directories(volume PRIVATE
   third_party/boost/include
   third_party/tbb/include
 )
+
+target_compile_definitions(volume PRIVATE NOMINMAX)
 
 target_link_directories(volume PRIVATE 
   ${PROJECT_SOURCE_DIR}/third_party/openvdb/lib
@@ -37,6 +42,9 @@ target_link_libraries(volume PRIVATE
 set(OPENEXR_BUILD_SHARED ON)
 add_subdirectory(third_party/ilmbase)
 target_link_libraries(volume PRIVATE IlmBase::Half)
+
+add_subdirectory(third_party/stb)
+target_link_libraries(volume PRIVATE stb)
 
 macro(copy_post_build target dll)
  add_custom_command(TARGET ${target} POST_BUILD  
