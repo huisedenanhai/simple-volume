@@ -44,8 +44,14 @@ int main() {
   std::cout << DATA_DIR << std::endl;
   openvdb::initialize();
   try {
-    std::ifstream is(DATA_DIR "/../.vscode/bunny_cloud.vdb",
+    std::ifstream is(DATA_DIR
+                     //  "/../.vscode/bunny_cloud.vdb"
+                     //  "/../.vscode/smoke2.vdb"
+                     "/smoke.vdb",
                      std::ios_base::binary);
+    if (!is.good()) {
+      throw std::runtime_error("failed to open file");
+    }
     auto grids = openvdb::io::Stream(is).getGrids();
     auto grid = openvdb::GridBase::grid<openvdb::FloatGrid>(grids->at(0));
 

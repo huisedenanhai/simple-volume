@@ -42,21 +42,31 @@ __device__ __forceinline__ float2 hammersley_sample(uint32_t i, uint32_t n) {
   return make_float2((float)(i + 1) / (float)(n), radical_inverse_base_2(i));
 }
 
-// y goes upward
 __device__ __forceinline__ float
-uniform_sample_hemisphere(float u, float v, float3 &d) {
-  auto theta = 2.0f * Pi * u;
-  auto y = v;
+uniform_sample_cone(float u, float v, float cos_phi, float3 &d) {
+  float theta = 2.0f * Pi * u;
+  float y = 1.0f - u * (1.0f - cos_phi);
   auto r = sqrtf(max(0.0f, 1.0f - y * y));
   d.x = r * cosf(theta);
   d.y = y;
   d.z = r * sinf(theta);
-  return 0.5f * InvPi;
+  return 0.5f * InvPi / (1.0f - cos_phi);
+}
+
+// y goes upward
+__device__ __forceinline__ float
+uniform_sample_hemisphere(float u, float v, float3 &d) {
+  return uniform_sample_cone(u, v, 0, d);
 }
 
 __device__ __forceinline__ float
 uniform_sample_hemisphere(unsigned int &randState, float3 &d) {
   return uniform_sample_hemisphere(rnd(randState), rnd(randState), d);
+}
+
+__device__ __forceinline__ float
+uniform_sample_sphere(float u, float v, float3 &d) {
+  return uniform_sample_cone(u, v, -1.0f, d);
 }
 
 // y goes upward
@@ -165,6 +175,27 @@ __global__ void render_kernel_raymarching(Scene scene, float3 *image) {
   image[index] = contrib;
 }
 
+__device__ __forceinline__ float3 get_light_emission(const Scene &scene,
+                                                     const float3 &direction) {
+  float3 light_dir =
+      make_float3(scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
+  return make_float3(1.0f, 1.0f, 1.0f);
+}
+
+__device__ __forceinline__ float sample_free_flight(float u, float mu) {
+  return -logf(1.0f - u) / mu;
+}
+
+__device__ __forceinline__ float3
+vec_as_float3(const nanovdb::Vec3<float> &vec) {
+  return make_float3(vec[0], vec[1], vec[2]);
+}
+
+__device__ __forceinline__ nanovdb::Vec3<float>
+float3_as_vec(const float3 &vec) {
+  return nanovdb::Vec3<float>(vec.x, vec.y, vec.z);
+}
+
 __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -175,10 +206,6 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   if ((c >= frame_width) || (r >= frame_height))
     return;
 
-  nanovdb::Vec3<float> light_direction(
-      scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
-  light_direction.normalize();
-
   unsigned int seed = tea<4>(index, 11424);
   int spp = scene.spp;
   float aspect = float(frame_width) / float(frame_height);
@@ -188,31 +215,51 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
                              scene.phase_func.color[1],
                              scene.phase_func.color[2]);
   float3 contrib = make_float3(0.0f, 0.0f, 0.0f);
+  auto accessor = grid->tree().getAccessor();
   for (int i = 0; i < spp; i++) {
     float2 jitter = hammersley_sample(i, spp);
-    nanovdb::Ray<float> wRay = sample_camera_ray(scene, c, r, jitter);
-    // transform the ray to the grid's index-space...
-    nanovdb::Ray<float> iRay = wRay.worldToIndexF(*grid);
-    // clip to bounds.
-    if (iRay.clip(grid->tree().bbox()) == false) {
-      image[index] = make_float3(0, 0, 0);
-      continue;
+    nanovdb::Ray<float> w_ray = sample_camera_ray(scene, c, r, jitter);
+    float3 factor = make_float3(1.0f, 1.0f, 1.0f);
+
+    bool miss = false;
+    for (int bounce = 0; !miss && bounce < 30; bounce++) {
+      nanovdb::Ray<float> i_ray = w_ray.worldToIndexF(*grid);
+      if (i_ray.clip(grid->tree().bbox()) == false) {
+        miss = true;
+        break;
+      }
+
+      float t = i_ray.t0();
+
+      while (t < i_ray.t1()) {
+        t += sample_free_flight(rnd(seed), max_value);
+        auto i_pos = i_ray(t);
+        float sigma = accessor.getValue(nanovdb::Coord::Floor(i_pos));
+        if (rnd(seed) > sigma / max_value) {
+          continue;
+        } else {
+          break;
+        }
+      }
+
+      if (t >= i_ray.t1()) {
+        miss = true;
+        break;
+      }
+
+      // hit happens, sample a new direction
+      auto next_origin = grid->indexToWorldF(i_ray(t));
+      float3 next_dir;
+      uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
+      w_ray = nanovdb::Ray<float>(next_origin, float3_as_vec(next_dir));
+      factor *= color;
     }
-    // get an accessor.
-    auto acc = grid->tree().getAccessor();
-    // integrate along ray interval...
-    float transmittance = 1.0f;
-    float dt = 0.5f;
-    for (float t = iRay.t0(); t < iRay.t1(); t += dt) {
-      auto iPos = iRay(t);
-      float sigma = acc.getValue(nanovdb::Coord::Floor(iPos));
-      contrib += ray_march_transmittance(
-                     grid, {grid->indexToWorldF(iPos), light_direction}, dt) *
-                 transmittance * dt * sigma * color * 0.25f * InvPi;
-      transmittance *= 1.0f - sigma * dt;
+
+    if (miss) {
+      contrib += factor * get_light_emission(scene, vec_as_float3(w_ray.dir()));
     }
   }
-  image[index] = contrib;
+  image[index] = contrib / float(spp);
 }
 
 template <typename Kernel, typename... Args>
@@ -230,14 +277,15 @@ void launch2d(Kernel &&k, int width, int height, Args &&... args) {
     cudaError_t e;                                                             \
     e = cudaGetLastError();                                                    \
     if (e != cudaSuccess) {                                                    \
-      printf("fuck\n");                                                        \
+      printf("CUDA ERROR\n");                                                  \
     }                                                                          \
   } while (false)
 
 void render(const Scene &scene, float *d_image) {
   printf("render\n");
   assert(scene.volume_grid);
-  auto kernel = render_kernel_raymarching;
+  // auto kernel = render_kernel_raymarching;
+  auto kernel = render_kernel_delta_tracking;
   launch2d(
       kernel, scene.frame_width, scene.frame_height, scene, (float3 *)d_image);
 }
