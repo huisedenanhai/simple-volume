@@ -5,7 +5,15 @@ set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -w -Xcompiler /utf-8")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")
 
-add_executable(volume main.cpp render.cu render.h)
+add_executable(volume 
+  main.cpp 
+  render.cu 
+  render.h
+  random.h
+  defs.h
+  math_consts.h
+  vec_math.h)
+
 target_compile_features(volume PRIVATE cxx_std_14)
 set_target_properties(volume 
   PROPERTIES

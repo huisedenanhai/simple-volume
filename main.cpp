@@ -35,7 +35,8 @@ static void save_result(float *d_image, int width, int height) {
   }
   stbi_flip_vertically_on_write(1);
   stbi_write_hdr("result/output.hdr", width, height, 3, result.data());
-  stbi_write_png("result/output.png", width, height, 3, resultAsBytes.data(), 0);
+  stbi_write_png(
+      "result/output.png", width, height, 3, resultAsBytes.data(), 0);
   printf("result written to result/output.png\n");
 }
 
@@ -46,14 +47,15 @@ int main() {
     std::ifstream is(DATA_DIR "/../.vscode/bunny_cloud.vdb",
                      std::ios_base::binary);
     auto grids = openvdb::io::Stream(is).getGrids();
-    auto handle =
-        nanovdb::openToNanoVDB<nanovdb::CudaDeviceBuffer>(grids->at(0));
+    auto grid = openvdb::GridBase::grid<openvdb::FloatGrid>(grids->at(0));
+
+    auto handle = nanovdb::openToNanoVDB<nanovdb::CudaDeviceBuffer>(grid);
     const nanovdb::GridMetaData *metadata = handle.gridMetaData();
     if (metadata->gridType() != nanovdb::GridType::Float) {
       throw std::runtime_error("only support float grid");
     }
     handle.deviceUpload();
-    const nanovdb::FloatGrid *grid = handle.deviceGrid<float>();
+    const nanovdb::FloatGrid *d_grid = handle.deviceGrid<float>();
 
     auto bbox = handle.gridMetaData()->worldBBox();
 
@@ -69,7 +71,19 @@ int main() {
     Scene scene{};
     scene.frame_width = frame_width;
     scene.frame_height = frame_height;
-    scene.volume_grid = grid;
+    scene.volume_grid = d_grid;
+    scene.light_dir[0] = 0.0f;
+    scene.light_dir[1] = 1.0f;
+    scene.light_dir[2] = 0.0f;
+    scene.spp = 100;
+
+    float min_value, max_value;
+    grid->evalMinMax(min_value, max_value);
+    printf("min: %f, max: %f\n", min_value, max_value);
+
+    scene.max_value = max_value;
+    float color[] = {0.8, 0.8, 0.8};
+    std::memcpy(scene.phase_func.color, color, sizeof(color));
 
     render(scene, d_image);
 

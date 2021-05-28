@@ -1,3 +1,4 @@
+#include "random.h"
 #include "render.h"
 #include "vec_math.h"
 #include <nanovdb/util/Ray.h>
@@ -23,7 +24,104 @@ __device__ float ray_march_transmittance(const nanovdb::FloatGrid *grid,
   return transmittance;
 }
 
-__global__ void render_kernel(Scene scene, float3 *image) {
+__device__ __forceinline__ uint32_t reverse_bits_32(uint32_t n) {
+  n = (n << 16) | (n >> 16);
+  n = ((n & 0x00ff00ff) << 8) | ((n & 0xff00ff00) >> 8);
+  n = ((n & 0x0f0f0f0f) << 4) | ((n & 0xf0f0f0f0) >> 4);
+  n = ((n & 0x33333333) << 2) | ((n & 0xcccccccc) >> 2);
+  n = ((n & 0x55555555) << 1) | ((n & 0xaaaaaaaa) >> 1);
+  return n;
+}
+
+__device__ __forceinline__ float radical_inverse_base_2(uint32_t n) {
+  return saturate(reverse_bits_32(n) * float(2.3283064365386963e-10));
+}
+
+// 0 <= i < n
+__device__ __forceinline__ float2 hammersley_sample(uint32_t i, uint32_t n) {
+  return make_float2((float)(i + 1) / (float)(n), radical_inverse_base_2(i));
+}
+
+// y goes upward
+__device__ __forceinline__ float
+uniform_sample_hemisphere(float u, float v, float3 &d) {
+  auto theta = 2.0f * Pi * u;
+  auto y = v;
+  auto r = sqrtf(max(0.0f, 1.0f - y * y));
+  d.x = r * cosf(theta);
+  d.y = y;
+  d.z = r * sinf(theta);
+  return 0.5f * InvPi;
+}
+
+__device__ __forceinline__ float
+uniform_sample_hemisphere(unsigned int &randState, float3 &d) {
+  return uniform_sample_hemisphere(rnd(randState), rnd(randState), d);
+}
+
+// y goes upward
+__device__ __forceinline__ float
+cosine_sample_hemisphere(float u, float v, float3 &d) {
+  auto theta = 2.0f * Pi * u;
+  auto r = sqrtf(v);
+  auto y = sqrtf(max(1 - r * r, 0.0f));
+  d.x = r * cosf(theta);
+  d.y = y;
+  d.z = r * sinf(theta);
+  return y * InvPi;
+}
+
+__device__ __forceinline__ float
+cosine_sample_hemisphere(unsigned int &randState, float3 &d) {
+  return cosine_sample_hemisphere(rnd(randState), rnd(randState), d);
+}
+
+__device__ __forceinline__ float lerp(float a, float b, float t) {
+  return a + t * (b - a);
+}
+
+__device__ __forceinline__ float4 lerp(float4 a, float4 b, float4 t) {
+  return make_float4(lerp(a.x, b.x, t.x),
+                     lerp(a.y, b.y, t.y),
+                     lerp(a.z, b.z, t.z),
+                     lerp(a.w, b.w, t.w));
+}
+
+__device__ __forceinline__ float4 lerp(float a, float b, float4 t) {
+  return lerp(make_float4(a, a, a, a), make_float4(b, b, b, b), t);
+}
+
+__device__ __forceinline__ float inverse_lerp(float a, float b, float v) {
+  return (v - a) / (b - a);
+}
+
+__device__ __forceinline__ float clamp(float v, float a, float b) {
+  return max(min(v, b), a);
+}
+
+__device__ __forceinline__ float
+sample_array(float *data, uint32_t count, float u) {
+  uint32_t i = clamp(count * u, 0, count - 2);
+  return lerp(data[i], data[i + 1], saturate(count * u - i));
+}
+
+__device__ __forceinline__ nanovdb::Ray<float> sample_camera_ray(
+    const Scene &scene, int c, int r, float2 jitter = make_float2(0.0f, 0.0f)) {
+  int frame_width = scene.frame_width;
+  int frame_height = scene.frame_height;
+
+  float2 uv = make_float2((float(c) + jitter.x) / float(frame_width),
+                          (float(r) + jitter.y) / float(frame_height));
+  float aspect = float(frame_width) / float(frame_height);
+
+  nanovdb::Vec3<float> origin(0, 20, 100);
+  nanovdb::Vec3<float> direction(uv.x - 0.5f, (uv.y - 0.5f) / aspect, -1.0);
+  direction.normalize();
+  nanovdb::Ray<float> wRay(origin, direction);
+  return wRay;
+}
+
+__global__ void render_kernel_raymarching(Scene scene, float3 *image) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y * blockDim.y + threadIdx.y;
   int frame_width = scene.frame_width;
@@ -32,24 +130,13 @@ __global__ void render_kernel(Scene scene, float3 *image) {
 
   if ((c >= frame_width) || (r >= frame_height))
     return;
-  nanovdb::Vec3<float> light_direction(0, 1, 0);
+
+  nanovdb::Vec3<float> light_direction(
+      scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
   light_direction.normalize();
-  if (r == 0 && c == 0) {
-    printf("%f, %f, %f\n",
-           light_direction[0],
-           light_direction[1],
-           light_direction[2]);
-  }
-
-  float2 uv = make_float2(float(c) / float(frame_width),
-                          float(r) / float(frame_height));
-  float aspect = float(frame_width) / float(frame_height);
-
   auto grid = scene.volume_grid;
-  nanovdb::Vec3<float> origin(0, 20, 100);
-  nanovdb::Vec3<float> direction(uv.x - 0.5f, (uv.y - 0.5f) / aspect, -1.0);
-  direction.normalize();
-  nanovdb::Ray<float> wRay(origin, direction);
+
+  nanovdb::Ray<float> wRay = sample_camera_ray(scene, c, r);
   // transform the ray to the grid's index-space...
   nanovdb::Ray<float> iRay = wRay.worldToIndexF(*grid);
   // clip to bounds.
@@ -61,17 +148,71 @@ __global__ void render_kernel(Scene scene, float3 *image) {
   auto acc = grid->tree().getAccessor();
   // integrate along ray interval...
   float transmittance = 1.0f;
-  float contrib = 0.0f;
+  float3 contrib = make_float3(0.0f, 0.0f, 0.0f);
   float dt = 0.5f;
+  float3 color = make_float3(scene.phase_func.color[0],
+                             scene.phase_func.color[1],
+                             scene.phase_func.color[2]);
+
   for (float t = iRay.t0(); t < iRay.t1(); t += dt) {
     auto iPos = iRay(t);
     float sigma = acc.getValue(nanovdb::Coord::Floor(iPos));
     contrib += ray_march_transmittance(
                    grid, {grid->indexToWorldF(iPos), light_direction}, dt) *
-               transmittance * dt * sigma;
+               transmittance * dt * sigma * color * 0.25f * InvPi;
     transmittance *= 1.0f - sigma * dt;
   }
-  image[index] = make_float3(1, 1, 1) * contrib;
+  image[index] = contrib;
+}
+
+__global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int frame_width = scene.frame_width;
+  int frame_height = scene.frame_height;
+  const int index = r * frame_width + c;
+
+  if ((c >= frame_width) || (r >= frame_height))
+    return;
+
+  nanovdb::Vec3<float> light_direction(
+      scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
+  light_direction.normalize();
+
+  unsigned int seed = tea<4>(index, 11424);
+  int spp = scene.spp;
+  float aspect = float(frame_width) / float(frame_height);
+  auto grid = scene.volume_grid;
+  float max_value = scene.max_value;
+  float3 color = make_float3(scene.phase_func.color[0],
+                             scene.phase_func.color[1],
+                             scene.phase_func.color[2]);
+  float3 contrib = make_float3(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < spp; i++) {
+    float2 jitter = hammersley_sample(i, spp);
+    nanovdb::Ray<float> wRay = sample_camera_ray(scene, c, r, jitter);
+    // transform the ray to the grid's index-space...
+    nanovdb::Ray<float> iRay = wRay.worldToIndexF(*grid);
+    // clip to bounds.
+    if (iRay.clip(grid->tree().bbox()) == false) {
+      image[index] = make_float3(0, 0, 0);
+      continue;
+    }
+    // get an accessor.
+    auto acc = grid->tree().getAccessor();
+    // integrate along ray interval...
+    float transmittance = 1.0f;
+    float dt = 0.5f;
+    for (float t = iRay.t0(); t < iRay.t1(); t += dt) {
+      auto iPos = iRay(t);
+      float sigma = acc.getValue(nanovdb::Coord::Floor(iPos));
+      contrib += ray_march_transmittance(
+                     grid, {grid->indexToWorldF(iPos), light_direction}, dt) *
+                 transmittance * dt * sigma * color * 0.25f * InvPi;
+      transmittance *= 1.0f - sigma * dt;
+    }
+  }
+  image[index] = contrib;
 }
 
 template <typename Kernel, typename... Args>
@@ -96,9 +237,7 @@ void launch2d(Kernel &&k, int width, int height, Args &&... args) {
 void render(const Scene &scene, float *d_image) {
   printf("render\n");
   assert(scene.volume_grid);
-  launch2d(render_kernel,
-           scene.frame_width,
-           scene.frame_height,
-           scene,
-           (float3 *)d_image);
+  auto kernel = render_kernel_raymarching;
+  launch2d(
+      kernel, scene.frame_width, scene.frame_height, scene, (float3 *)d_image);
 }
