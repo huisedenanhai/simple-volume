@@ -14,6 +14,8 @@ struct Scene {
   float max_value;
   struct PhaseFunction {
     float color[3];
+    float cos_angle;
+    float diffuse;
   } phase_func;
 };
 

@@ -178,8 +178,8 @@ __global__ void render_kernel_raymarching(Scene scene, float3 *image) {
 
 __device__ __forceinline__ float3 get_light_emission(const Scene &scene,
                                                      const float3 &direction) {
-  float3 light_dir =
-      make_float3(scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
+  float3 light_dir = normalize(
+      make_float3(scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]));
   float attenuation =
       dot(light_dir, direction) >= scene.light_cos_angle ? 1.0f : 0.0f;
   auto &light_color = scene.light_color;
@@ -237,10 +237,13 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
       float t = i_ray.t0();
 
       while (t < i_ray.t1()) {
-        t += sample_free_flight(rnd(seed), max_value);
+        float sigma_scale = 1.0f;
+        float scaled_max_value = max(max_value * sigma_scale, 1e-3);
+        t += sample_free_flight(rnd(seed), scaled_max_value);
         auto i_pos = i_ray(t);
-        float sigma = accessor.getValue(nanovdb::Coord::Floor(i_pos));
-        if (rnd(seed) > sigma / max_value) {
+        float sigma =
+            accessor.getValue(nanovdb::Coord::Floor(i_pos)) * sigma_scale;
+        if (rnd(seed) > sigma / scaled_max_value) {
           continue;
         } else {
           break;
@@ -255,7 +258,26 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
       // hit happens, sample a new direction
       auto next_origin = grid->indexToWorldF(i_ray(t));
       float3 next_dir;
-      uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
+
+      // uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
+      {
+        if (rnd(seed) < scene.phase_func.diffuse) {
+          uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
+        } else {
+          float3 curr_dir = normalize(vec_as_float3(w_ray.dir()));
+          float3 up = make_float3(0.0f, 0.0f, 1.0f);
+          if (curr_dir.z == 1.0f) {
+            float3 up = make_float3(1.0f, 0.0f, 0.0f);
+          }
+          float3 t = normalize(cross(up, curr_dir));
+          float3 b = normalize(cross(t, curr_dir));
+          float3 next_dir_local;
+          uniform_sample_cone(
+              rnd(seed), rnd(seed), scene.phase_func.cos_angle, next_dir_local);
+          next_dir = normalize(next_dir_local.y * curr_dir +
+                               next_dir_local.x * t + next_dir_local.z * b);
+        }
+      }
       w_ray = nanovdb::Ray<float>(next_origin, float3_as_vec(next_dir));
       factor *= color;
     }

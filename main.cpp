@@ -116,6 +116,10 @@ int main(int argc, char **argv) {
   scene.max_value = max_value;
 
   get_config_float3(scene.phase_func.color, "color", 0.8f, 0.8f, 0.8f);
+  scene.phase_func.cos_angle = static_cast<float>(
+      config->get_as<double>("phase_cos_angle").value_or(-1.0));
+  scene.phase_func.diffuse =
+      static_cast<float>(config->get_as<double>("phase_diffuse").value_or(1.0));
 
   render(scene, d_image);
 
