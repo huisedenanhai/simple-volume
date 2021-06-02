@@ -6,8 +6,10 @@ struct Scene {
   int frame_width;
   int frame_height;
   const nanovdb::FloatGrid *volume_grid;
+  float camera_pos[3];
   float light_dir[3];
-  float light_half_angle;
+  float light_color[3];
+  float light_cos_angle;
   int spp;
   float max_value;
   struct PhaseFunction {

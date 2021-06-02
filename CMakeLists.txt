@@ -14,7 +14,7 @@ add_executable(volume
   math_consts.h
   vec_math.h)
 
-target_compile_features(volume PRIVATE cxx_std_14)
+target_compile_features(volume PRIVATE cxx_std_17)
 set_target_properties(volume 
   PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON)
@@ -30,6 +30,7 @@ target_include_directories(volume PRIVATE
   third_party/openexr/include
   third_party/boost/include
   third_party/tbb/include
+  third_party/cpptoml
 )
 
 target_compile_definitions(volume PRIVATE NOMINMAX)

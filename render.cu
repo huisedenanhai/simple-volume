@@ -124,7 +124,8 @@ __device__ __forceinline__ nanovdb::Ray<float> sample_camera_ray(
                           (float(r) + jitter.y) / float(frame_height));
   float aspect = float(frame_width) / float(frame_height);
 
-  nanovdb::Vec3<float> origin(0, 20, 100);
+  auto &camera_pos = scene.camera_pos;
+  nanovdb::Vec3<float> origin(camera_pos[0], camera_pos[1], camera_pos[2]);
   nanovdb::Vec3<float> direction(uv.x - 0.5f, (uv.y - 0.5f) / aspect, -1.0);
   direction.normalize();
   nanovdb::Ray<float> wRay(origin, direction);
@@ -179,7 +180,11 @@ __device__ __forceinline__ float3 get_light_emission(const Scene &scene,
                                                      const float3 &direction) {
   float3 light_dir =
       make_float3(scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]);
-  return make_float3(1.0f, 1.0f, 1.0f);
+  float attenuation =
+      dot(light_dir, direction) >= scene.light_cos_angle ? 1.0f : 0.0f;
+  auto &light_color = scene.light_color;
+  return attenuation *
+         make_float3(light_color[0], light_color[1], light_color[2]);
 }
 
 __device__ __forceinline__ float sample_free_flight(float u, float mu) {
