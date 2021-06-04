@@ -4,6 +4,20 @@
 #include <nanovdb/util/Ray.h>
 #include <stdio.h>
 
+__device__ __forceinline__ float3 array_as_float3(const float *vec) {
+  return make_float3(vec[0], vec[1], vec[2]);
+}
+
+__device__ __forceinline__ float3
+vec_as_float3(const nanovdb::Vec3<float> &vec) {
+  return make_float3(vec[0], vec[1], vec[2]);
+}
+
+__device__ __forceinline__ nanovdb::Vec3<float>
+float3_as_vec(const float3 &vec) {
+  return nanovdb::Vec3<float>(vec.x, vec.y, vec.z);
+}
+
 __device__ float ray_march_transmittance(const nanovdb::FloatGrid *grid,
                                          const nanovdb::Ray<float> &wRay,
                                          float dt) {
@@ -42,6 +56,10 @@ __device__ __forceinline__ float2 hammersley_sample(uint32_t i, uint32_t n) {
   return make_float2((float)(i + 1) / (float)(n), radical_inverse_base_2(i));
 }
 
+__device__ __forceinline__ float uniform_sample_cone_pdf(float cos_phi) {
+  return 0.5f * InvPi / (1.0f - cos_phi);
+}
+
 __device__ __forceinline__ float
 uniform_sample_cone(float u, float v, float cos_phi, float3 &d) {
   float theta = 2.0f * Pi * u;
@@ -50,7 +68,7 @@ uniform_sample_cone(float u, float v, float cos_phi, float3 &d) {
   d.x = r * cosf(theta);
   d.y = y;
   d.z = r * sinf(theta);
-  return 0.5f * InvPi / (1.0f - cos_phi);
+  return uniform_sample_cone_pdf(cos_phi);
 }
 
 // y goes upward
@@ -176,29 +194,68 @@ __global__ void render_kernel_raymarching(Scene scene, float3 *image) {
   image[index] = contrib;
 }
 
+struct TBN {
+  float3 n;
+  float3 t;
+  float3 b;
+
+  __device__ __forceinline__ float3 local_to_world(const float3 &v) const {
+    return n * v.y + t * v.x + b * v.z;
+  }
+};
+
+__device__ __forceinline__ TBN construct_tbn(const float3 &normal) {
+  float3 n = normalize(normal);
+  float3 up = make_float3(0.0f, 0.0f, 1.0f);
+  if (n.z > 0.98f) {
+    up = make_float3(1.0f, 0.0f, 0.0f);
+  }
+  float3 t = normalize(cross(up, n));
+  float3 b = normalize(cross(t, n));
+  TBN tbn{};
+  tbn.n = n;
+  tbn.t = t;
+  tbn.b = b;
+  return tbn;
+}
+
 __device__ __forceinline__ float3 get_light_emission(const Scene &scene,
                                                      const float3 &direction) {
-  float3 light_dir = normalize(
-      make_float3(scene.light_dir[0], scene.light_dir[1], scene.light_dir[2]));
+  float3 light_dir = normalize(array_as_float3(scene.light_dir));
   float attenuation =
       dot(light_dir, direction) >= scene.light_cos_angle ? 1.0f : 0.0f;
-  auto &light_color = scene.light_color;
-  return attenuation *
-         make_float3(light_color[0], light_color[1], light_color[2]);
+  return attenuation * array_as_float3(scene.light_color);
+}
+
+__device__ __forceinline__ float sample_light(const Scene &scene,
+                                              unsigned int &seed,
+                                              float3 &direction,
+                                              float3 &emission) {
+  float3 local_dir;
+  float pdf = uniform_sample_cone(
+      rnd(seed), rnd(seed), scene.light_cos_angle, local_dir);
+  float3 light_dir = normalize(array_as_float3(scene.light_dir));
+
+  direction = construct_tbn(light_dir).local_to_world(local_dir);
+  emission = array_as_float3(scene.light_color);
+  return pdf;
 }
 
 __device__ __forceinline__ float sample_free_flight(float u, float mu) {
   return -logf(1.0f - u) / mu;
 }
 
-__device__ __forceinline__ float3
-vec_as_float3(const nanovdb::Vec3<float> &vec) {
-  return make_float3(vec[0], vec[1], vec[2]);
-}
+__device__ __forceinline__ float eval_phase_function(float diffuse,
+                                                     float cos_angle,
+                                                     const float3 &curr_dir,
+                                                     const float3 &next_dir) {
+  float uniform_pdf = 0.25f * InvPi;
+  float cone_pdf = 0.0f;
+  if (dot(curr_dir, next_dir) > cos_angle) {
+    cone_pdf = uniform_sample_cone_pdf(cos_angle);
+  }
 
-__device__ __forceinline__ nanovdb::Vec3<float>
-float3_as_vec(const float3 &vec) {
-  return nanovdb::Vec3<float>(vec.x, vec.y, vec.z);
+  return lerp(cone_pdf, uniform_pdf, clamp(diffuse, 0.0f, 1.0f));
 }
 
 __device__ __forceinline__ float sample_phase_function(unsigned int &seed,
@@ -207,24 +264,68 @@ __device__ __forceinline__ float sample_phase_function(unsigned int &seed,
                                                        const float3 &curr_dir,
                                                        float3 &next_dir) {
   if (rnd(seed) < diffuse) {
-    return diffuse * uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
+    uniform_sample_sphere(rnd(seed), rnd(seed), next_dir);
   } else {
-    float3 up = make_float3(0.0f, 0.0f, 1.0f);
-    if (curr_dir.z == 1.0f) {
-      float3 up = make_float3(1.0f, 0.0f, 0.0f);
-    }
-    float3 t = normalize(cross(up, curr_dir));
-    float3 b = normalize(cross(t, curr_dir));
     float3 next_dir_local;
-    float pdf =
-        (1.0f - diffuse) *
-        uniform_sample_cone(rnd(seed), rnd(seed), cos_angle, next_dir_local);
-    next_dir = normalize(next_dir_local.y * curr_dir + next_dir_local.x * t +
-                         next_dir_local.z * b);
-    return pdf;
+    uniform_sample_cone(rnd(seed), rnd(seed), cos_angle, next_dir_local);
+    next_dir = construct_tbn(curr_dir).local_to_world(next_dir_local);
   }
+  return eval_phase_function(diffuse, cos_angle, curr_dir, next_dir);
 }
 
+struct DeltaTrackResult {
+  bool miss = false;
+  float t = 0;
+  float null_scatter_factor = 1.0f;
+};
+
+template <bool force_null_scatter = false>
+__device__ __forceinline__ DeltaTrackResult
+delta_track_ray(const nanovdb::FloatGrid *grid,
+                const decltype(grid->getAccessor()) &accessor,
+                unsigned int &seed,
+                float max_sigma,
+                float sigma_scale,
+                nanovdb::Ray<float> &i_ray) {
+  DeltaTrackResult res{};
+  res.t = i_ray.t0();
+  if (i_ray.clip(grid->tree().bbox()) == false) {
+    res.miss = true;
+    return res;
+  }
+
+  float &t = res.t;
+  float &factor = res.null_scatter_factor;
+  float last_null_scatter_factor = 1.0f;
+
+  while (t < i_ray.t1()) {
+    float scaled_max_value = max(max_sigma * sigma_scale, 1e-4);
+    t += sample_free_flight(rnd(seed), scaled_max_value);
+    factor *= last_null_scatter_factor;
+
+    auto i_pos = i_ray(t);
+    float sigma = accessor.getValue(nanovdb::Coord::Floor(i_pos)) * sigma_scale;
+    float real_scatter_p = sigma / scaled_max_value;
+    last_null_scatter_factor = 1.0f - real_scatter_p;
+
+    if constexpr (force_null_scatter) {
+      continue;
+    }
+    if (rnd(seed) > real_scatter_p) {
+      continue;
+    } else {
+      break;
+    }
+  }
+
+  if (t >= i_ray.t1()) {
+    res.miss = true;
+  }
+
+  return res;
+}
+
+template <bool do_ratio_tracking = false>
 __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -240,6 +341,8 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   float aspect = float(frame_width) / float(frame_height);
   auto grid = scene.volume_grid;
   float max_value = scene.max_value;
+  float sigma_scale = 1.0f;
+  float scaled_max_value = sigma_scale * max_value;
   float3 color = make_float3(scene.phase_func.color[0],
                              scene.phase_func.color[1],
                              scene.phase_func.color[2]);
@@ -251,48 +354,50 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
     float3 factor = make_float3(1.0f, 1.0f, 1.0f);
 
     bool miss = false;
-    for (int bounce = 0; !miss && bounce < 30; bounce++) {
+    int bounce = 0;
+    for (; !miss && bounce < 30; bounce++) {
       nanovdb::Ray<float> i_ray = w_ray.worldToIndexF(*grid);
-      if (i_ray.clip(grid->tree().bbox()) == false) {
+      auto hit =
+          delta_track_ray(grid, accessor, seed, max_value, sigma_scale, i_ray);
+      if (hit.miss) {
         miss = true;
         break;
       }
-
-      float t = i_ray.t0();
-
-      while (t < i_ray.t1()) {
-        float sigma_scale = 1.0f;
-        float scaled_max_value = max(max_value * sigma_scale, 1e-3);
-        t += sample_free_flight(rnd(seed), scaled_max_value);
-        auto i_pos = i_ray(t);
-        float sigma =
-            accessor.getValue(nanovdb::Coord::Floor(i_pos)) * sigma_scale;
-        if (rnd(seed) > sigma / scaled_max_value) {
-          continue;
-        } else {
-          break;
-        }
-      }
-
-      if (t >= i_ray.t1()) {
-        miss = true;
-        break;
-      }
-
       // hit happens, sample a new direction
-      auto next_origin = grid->indexToWorldF(i_ray(t));
+      auto next_origin = grid->indexToWorldF(i_ray(hit.t));
+      float3 curr_dir = normalize(vec_as_float3(w_ray.dir()));
       float3 next_dir;
       sample_phase_function(seed,
                             scene.phase_func.diffuse,
                             scene.phase_func.cos_angle,
-                            normalize(vec_as_float3(w_ray.dir())),
+                            curr_dir,
                             next_dir);
       w_ray = nanovdb::Ray<float>(next_origin, float3_as_vec(next_dir));
       factor *= color;
+
+      if constexpr (do_ratio_tracking) {
+        float3 light_dir;
+        float3 light_emission;
+        float pe = sample_light(scene, seed, light_dir, light_emission);
+        nanovdb::Ray<float> w_light_ray(next_origin, float3_as_vec(light_dir));
+        nanovdb::Ray<float> i_light_ray = w_light_ray.worldToIndexF(*grid);
+        auto rt = delta_track_ray<true>(
+            grid, accessor, seed, max_value, sigma_scale, i_light_ray);
+        float phase = eval_phase_function(scene.phase_func.diffuse,
+                                          scene.phase_func.cos_angle,
+                                          curr_dir,
+                                          normalize(light_dir));
+        contrib +=
+            factor * phase * rt.null_scatter_factor * light_emission / pe;
+      }
     }
 
     if (miss) {
-      contrib += factor * get_light_emission(scene, vec_as_float3(w_ray.dir()));
+      if (!do_ratio_tracking || bounce == 0) {
+        // pure ratio tracking only handles one or more bounces
+        contrib +=
+            factor * get_light_emission(scene, vec_as_float3(w_ray.dir()));
+      }
     }
   }
   image[index] = contrib / float(spp);
@@ -321,7 +426,8 @@ void render(const Scene &scene, float *d_image) {
   printf("render\n");
   assert(scene.volume_grid);
   // auto kernel = render_kernel_raymarching;
-  auto kernel = render_kernel_delta_tracking;
+  auto kernel = render_kernel_delta_tracking<false>;
+  // auto kernel = render_kernel_delta_tracking<true>;
   launch2d(
       kernel, scene.frame_width, scene.frame_height, scene, (float3 *)d_image);
 }
