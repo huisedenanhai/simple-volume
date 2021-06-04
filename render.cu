@@ -63,7 +63,7 @@ __device__ __forceinline__ float uniform_sample_cone_pdf(float cos_phi) {
 __device__ __forceinline__ float
 uniform_sample_cone(float u, float v, float cos_phi, float3 &d) {
   float theta = 2.0f * Pi * u;
-  float y = 1.0f - u * (1.0f - cos_phi);
+  float y = 1.0f - v * (1.0f - cos_phi);
   auto r = sqrtf(max(0.0f, 1.0f - y * y));
   d.x = r * cosf(theta);
   d.y = y;
@@ -325,7 +325,7 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
   return res;
 }
 
-template <bool do_ratio_tracking = false>
+template <bool do_ratio_tracking>
 __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -342,7 +342,6 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   auto grid = scene.volume_grid;
   float max_value = scene.max_value;
   float sigma_scale = 1.0f;
-  float scaled_max_value = sigma_scale * max_value;
   float3 color = make_float3(scene.phase_func.color[0],
                              scene.phase_func.color[1],
                              scene.phase_func.color[2]);
@@ -357,8 +356,8 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
     int bounce = 0;
     for (; !miss && bounce < 30; bounce++) {
       nanovdb::Ray<float> i_ray = w_ray.worldToIndexF(*grid);
-      auto hit =
-          delta_track_ray(grid, accessor, seed, max_value, sigma_scale, i_ray);
+      auto hit = delta_track_ray<false>(
+          grid, accessor, seed, max_value, sigma_scale, i_ray);
       if (hit.miss) {
         miss = true;
         break;
@@ -379,7 +378,8 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
         float3 light_dir;
         float3 light_emission;
         float pe = sample_light(scene, seed, light_dir, light_emission);
-        nanovdb::Ray<float> w_light_ray(next_origin, float3_as_vec(light_dir));
+        nanovdb::Ray<float> w_light_ray(next_origin,
+                                        float3_as_vec(normalize(light_dir)));
         nanovdb::Ray<float> i_light_ray = w_light_ray.worldToIndexF(*grid);
         auto rt = delta_track_ray<true>(
             grid, accessor, seed, max_value, sigma_scale, i_light_ray);
@@ -425,9 +425,29 @@ void launch2d(Kernel &&k, int width, int height, Args &&... args) {
 void render(const Scene &scene, float *d_image) {
   printf("render\n");
   assert(scene.volume_grid);
-  // auto kernel = render_kernel_raymarching;
-  auto kernel = render_kernel_delta_tracking<false>;
-  // auto kernel = render_kernel_delta_tracking<true>;
-  launch2d(
-      kernel, scene.frame_width, scene.frame_height, scene, (float3 *)d_image);
+
+  auto launch = [&](auto kernel) {
+    launch2d(kernel,
+             scene.frame_width,
+             scene.frame_height,
+             scene,
+             (float3 *)d_image);
+  };
+
+  switch (scene.mode) {
+  case RenderMode::DeltaTracking:
+    launch(render_kernel_delta_tracking<false>);
+    break;
+  case RenderMode::RatioTracking:
+    launch(render_kernel_delta_tracking<true>);
+    break;
+  case RenderMode::MIS:
+    launch(render_kernel_delta_tracking<false>);
+    break;
+  case RenderMode::SpectralMIS:
+    launch(render_kernel_delta_tracking<false>);
+    break;
+  }
+
+  cudaDeviceSynchronize();
 }

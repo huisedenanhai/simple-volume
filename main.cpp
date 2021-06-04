@@ -1,4 +1,5 @@
 #include "render.h"
+#include <chrono>
 #include <config.h>
 #include <cpptoml.h>
 #include <filesystem>
@@ -121,7 +122,30 @@ int main(int argc, char **argv) {
   scene.phase_func.diffuse =
       static_cast<float>(config->get_as<double>("phase_diffuse").value_or(1.0));
 
+  scene.mode =
+      render_mode_from_str(config->get_as<std::string>("mode").value_or(""));
+
+  auto start_time = std::chrono::system_clock::now();
+  {
+    auto t = std::chrono::system_clock::to_time_t(start_time);
+    std::cout << "render start at " << std::ctime(&t) << std::flush;
+  }
+
   render(scene, d_image);
+
+  auto end_time = std::chrono::system_clock::now();
+  {
+    using namespace std::chrono;
+    auto t = system_clock::to_time_t(end_time);
+    // TODO more pretty output
+    auto s = duration<float>(end_time - start_time).count();
+    auto m = floor(s / 60.0);
+    s -= m * 60.0f;
+    auto h = floor(m / 60.0);
+    m -= h * 60.0f;
+    std::cout << "render finished at " << std::ctime(&t) << std::flush;
+    std::cout << "duration " << h << ":" << m << ":" << s << std::endl;
+  }
 
   save_result(config->get_as<std::string>("out").value_or("result"),
               d_image,
