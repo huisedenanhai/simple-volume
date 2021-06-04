@@ -104,6 +104,7 @@ int main(int argc, char **argv) {
   scene.frame_height = frame_height;
   scene.volume_grid = d_grid;
   get_config_float3(scene.camera_pos, "camera_pos", 0.0f, 20.0f, 100.0f);
+  get_config_float3(scene.camera_dir_sign, "camera_dir_sign", 1.0f, 1.0f, 1.0f);
   get_config_float3(scene.light_dir, "light_dir", 0.0f, 1.0f, 0.0f);
   get_config_float3(scene.light_color, "light_color", 1.0f, 1.0f, 1.0f);
   scene.light_cos_angle = static_cast<float>(
@@ -121,6 +122,9 @@ int main(int argc, char **argv) {
       config->get_as<double>("phase_cos_angle").value_or(-1.0));
   scene.phase_func.diffuse =
       static_cast<float>(config->get_as<double>("phase_diffuse").value_or(1.0));
+
+  get_config_float3(
+      scene.extinction_scale, "extinction_scale", 1.0f, 1.0f, 1.0f);
 
   scene.mode =
       render_mode_from_str(config->get_as<std::string>("mode").value_or(""));

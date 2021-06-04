@@ -1,0 +1,14 @@
+camera_pos = [0.0, 20.0, 100.0]
+color = [0.8, 0.8, 0.8]
+file = "bunny_cloud.vdb"
+frame_height = 600
+frame_width = 800
+light_cos_angle = -1.0
+light_dir = [5.0, 5.0, 0.0]
+light_color = [1.0, 1.0, 1.0]
+out = "bunny_cloud_dt"
+phase_cos_angle = 0.0
+phase_diffuse = 1.0
+spp = 10
+# mode = "RatioTracking"
+mode = "DeltaTracking"

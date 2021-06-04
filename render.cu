@@ -144,7 +144,10 @@ __device__ __forceinline__ nanovdb::Ray<float> sample_camera_ray(
 
   auto &camera_pos = scene.camera_pos;
   nanovdb::Vec3<float> origin(camera_pos[0], camera_pos[1], camera_pos[2]);
-  nanovdb::Vec3<float> direction(uv.x - 0.5f, (uv.y - 0.5f) / aspect, -1.0);
+  nanovdb::Vec3<float> direction((uv.x - 0.5f) * scene.camera_dir_sign[0],
+                                 (uv.y - 0.5f) / aspect *
+                                     scene.camera_dir_sign[1],
+                                 -scene.camera_dir_sign[2]);
   direction.normalize();
   nanovdb::Ray<float> wRay(origin, direction);
   return wRay;
@@ -334,22 +337,16 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
 }
 
 template <RenderMode mode>
-__global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+__device__ __forceinline__ float3 render_pixel_delta_tracking(
+    const Scene &scene, int c, int r, float sigma_scale) {
   int frame_width = scene.frame_width;
   int frame_height = scene.frame_height;
   const int index = r * frame_width + c;
-
-  if ((c >= frame_width) || (r >= frame_height))
-    return;
-
   unsigned int seed = tea<4>(index, 11424);
   int spp = scene.spp;
   float aspect = float(frame_width) / float(frame_height);
   auto grid = scene.volume_grid;
   float max_value = scene.max_value;
-  float sigma_scale = 1.0f;
   float3 color = make_float3(scene.phase_func.color[0],
                              scene.phase_func.color[1],
                              scene.phase_func.color[2]);
@@ -425,7 +422,41 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
       }
     }
   }
-  image[index] = contrib / float(spp);
+  return contrib / float(spp);
+}
+
+template <RenderMode mode>
+__global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int frame_width = scene.frame_width;
+  int frame_height = scene.frame_height;
+  const int index = r * frame_width + c;
+
+  if ((c >= frame_width) || (r >= frame_height))
+    return;
+
+  image[index] = render_pixel_delta_tracking<mode>(scene, c, r, 1.0f);
+}
+
+template <RenderMode mode>
+__global__ void render_kernel_spectral_seperate(Scene scene, float3 *image) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int frame_width = scene.frame_width;
+  int frame_height = scene.frame_height;
+  const int index = r * frame_width + c;
+
+  if ((c >= frame_width) || (r >= frame_height))
+    return;
+
+  image[index] = make_float3(
+      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[0])
+          .x,
+      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[1])
+          .y,
+      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[2])
+          .z);
 }
 
 template <typename Kernel, typename... Args>
@@ -468,6 +499,9 @@ void render(const Scene &scene, float *d_image) {
     break;
   case RenderMode::MIS:
     launch(render_kernel_delta_tracking<RenderMode::MIS>);
+    break;
+  case RenderMode::SpectralSeperate:
+    launch(render_kernel_spectral_seperate<RenderMode::MIS>);
     break;
   case RenderMode::SpectralMIS:
     launch(render_kernel_delta_tracking<RenderMode::SpectralMIS>);

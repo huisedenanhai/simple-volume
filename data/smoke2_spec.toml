@@ -1,0 +1,15 @@
+camera_dir_sign = [1.0, 1.0, -1.0]
+camera_pos = [2.0, 25.0, -30.0]
+color = [0.01, 0.01, 0.01]
+extinction_scale = [3.0, 10.0, 3.0]
+file = "smoke2.vdb"
+frame_height = 600
+frame_width = 300
+light_color = [1000.0, 1000.0, 1000.0]
+light_cos_angle = 0.9
+light_dir = [-0.5, 0.0, 0.0]
+mode = "SpectralSeperate"
+out = "smoke2_spec"
+phase_cos_angle = 0.5
+phase_diffuse = 0.8
+spp = 10

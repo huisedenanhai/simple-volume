@@ -3,7 +3,13 @@
 #include <nanovdb/NanoVDB.h>
 #include <string>
 
-enum class RenderMode { DeltaTracking, RatioTracking, MIS, SpectralMIS };
+enum class RenderMode {
+  DeltaTracking,
+  RatioTracking,
+  MIS,
+  SpectralSeperate,
+  SpectralMIS
+};
 
 inline RenderMode render_mode_from_str(const std::string &str) {
 #define RENDER_MODE_CASE(name)                                                 \
@@ -16,6 +22,7 @@ inline RenderMode render_mode_from_str(const std::string &str) {
   RENDER_MODE_CASE(DeltaTracking);
   RENDER_MODE_CASE(RatioTracking);
   RENDER_MODE_CASE(MIS);
+  RENDER_MODE_CASE(SpectralSeperate);
   RENDER_MODE_CASE(SpectralMIS);
 
 #undef RENDER_MODE_CASE
@@ -27,6 +34,7 @@ struct Scene {
   int frame_height;
   const nanovdb::FloatGrid *volume_grid;
   float camera_pos[3];
+  float camera_dir_sign[3];
   float light_dir[3];
   float light_color[3];
   float light_cos_angle;
@@ -37,6 +45,9 @@ struct Scene {
     float cos_angle;
     float diffuse;
   } phase_func;
+
+  float extinction_scale[3];
+
   RenderMode mode;
 };
 

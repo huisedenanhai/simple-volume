@@ -1,0 +1,16 @@
+camera_dir_sign = [1.0, 1.0, -1.0]
+camera_pos = [2.0, 25.0, -30.0]
+color = [0.8, 0.8, 0.8]
+file = "smoke2.vdb"
+frame_height = 600
+frame_width = 300
+light_color = [7.0, 7.0, 7.0]
+light_cos_angle = 0.8
+light_dir = [-0.5, 0.2, 0.0]
+mode = "DeltaTracking"
+# mode = "RatioTracking"
+# mode = "MIS"
+out = "smoke2_dt"
+phase_cos_angle = 0.5
+phase_diffuse = 0.5
+spp = 100
