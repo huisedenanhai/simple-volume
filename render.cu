@@ -241,6 +241,14 @@ __device__ __forceinline__ float sample_light(const Scene &scene,
   return pdf;
 }
 
+__device__ __forceinline__ float sample_light_pdf(const Scene &scene,
+                                                  float3 &direction) {
+  float3 light_dir = normalize(array_as_float3(scene.light_dir));
+  float attenuation =
+      dot(light_dir, direction) >= scene.light_cos_angle ? 1.0f : 0.0f;
+  return uniform_sample_cone_pdf(scene.light_cos_angle) * attenuation;
+}
+
 __device__ __forceinline__ float sample_free_flight(float u, float mu) {
   return -logf(1.0f - u) / mu;
 }
@@ -325,7 +333,7 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
   return res;
 }
 
-template <bool do_ratio_tracking>
+template <RenderMode mode>
 __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -352,29 +360,30 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
     nanovdb::Ray<float> w_ray = sample_camera_ray(scene, c, r, jitter);
     float3 factor = make_float3(1.0f, 1.0f, 1.0f);
 
-    bool miss = false;
+    DeltaTrackResult hit{};
+    float last_phase = 1.0f;
     int bounce = 0;
-    for (; !miss && bounce < 30; bounce++) {
+    for (; !hit.miss && bounce < 30; bounce++) {
       nanovdb::Ray<float> i_ray = w_ray.worldToIndexF(*grid);
-      auto hit = delta_track_ray<false>(
+      hit = delta_track_ray<false>(
           grid, accessor, seed, max_value, sigma_scale, i_ray);
       if (hit.miss) {
-        miss = true;
         break;
       }
       // hit happens, sample a new direction
       auto next_origin = grid->indexToWorldF(i_ray(hit.t));
       float3 curr_dir = normalize(vec_as_float3(w_ray.dir()));
       float3 next_dir;
-      sample_phase_function(seed,
-                            scene.phase_func.diffuse,
-                            scene.phase_func.cos_angle,
-                            curr_dir,
-                            next_dir);
+      last_phase = sample_phase_function(seed,
+                                         scene.phase_func.diffuse,
+                                         scene.phase_func.cos_angle,
+                                         curr_dir,
+                                         next_dir);
       w_ray = nanovdb::Ray<float>(next_origin, float3_as_vec(next_dir));
       factor *= color;
 
-      if constexpr (do_ratio_tracking) {
+      if constexpr (mode == RenderMode::RatioTracking ||
+                    mode == RenderMode::MIS) {
         float3 light_dir;
         float3 light_emission;
         float pe = sample_light(scene, seed, light_dir, light_emission);
@@ -387,16 +396,32 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
                                           scene.phase_func.cos_angle,
                                           curr_dir,
                                           normalize(light_dir));
-        contrib +=
+        float3 rt_contrib =
             factor * phase * rt.null_scatter_factor * light_emission / pe;
+        if constexpr (mode == RenderMode::RatioTracking) {
+          contrib += rt_contrib;
+        }
+
+        if constexpr (mode == RenderMode::MIS) {
+          // balance heuristic
+          float w_rt = pe / (pe + rt.null_scatter_factor * phase);
+          contrib += rt_contrib * w_rt;
+        }
       }
     }
 
-    if (miss) {
-      if (!do_ratio_tracking || bounce == 0) {
+    if (hit.miss) {
+      if (mode != RenderMode::RatioTracking || bounce == 0) {
         // pure ratio tracking only handles one or more bounces
-        contrib +=
-            factor * get_light_emission(scene, vec_as_float3(w_ray.dir()));
+        float w_dt = 1.0f;
+        if (mode == RenderMode::MIS && bounce != 0) {
+          float pe =
+              sample_light_pdf(scene, normalize(vec_as_float3(w_ray.dir())));
+          w_dt = hit.null_scatter_factor * last_phase /
+                 (pe + hit.null_scatter_factor * last_phase);
+        }
+        contrib += w_dt * factor *
+                   get_light_emission(scene, vec_as_float3(w_ray.dir()));
       }
     }
   }
@@ -436,16 +461,16 @@ void render(const Scene &scene, float *d_image) {
 
   switch (scene.mode) {
   case RenderMode::DeltaTracking:
-    launch(render_kernel_delta_tracking<false>);
+    launch(render_kernel_delta_tracking<RenderMode::DeltaTracking>);
     break;
   case RenderMode::RatioTracking:
-    launch(render_kernel_delta_tracking<true>);
+    launch(render_kernel_delta_tracking<RenderMode::RatioTracking>);
     break;
   case RenderMode::MIS:
-    launch(render_kernel_delta_tracking<false>);
+    launch(render_kernel_delta_tracking<RenderMode::MIS>);
     break;
   case RenderMode::SpectralMIS:
-    launch(render_kernel_delta_tracking<false>);
+    launch(render_kernel_delta_tracking<RenderMode::SpectralMIS>);
     break;
   }
 
