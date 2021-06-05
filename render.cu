@@ -284,10 +284,23 @@ __device__ __forceinline__ float sample_phase_function(unsigned int &seed,
   return eval_phase_function(diffuse, cos_angle, curr_dir, next_dir);
 }
 
+__device__ __forceinline__ float3 expf(const float3 &v) {
+  return make_float3(expf(v.x), expf(v.y), expf(v.z));
+}
+
+__device__ __forceinline__ float average(const float3 &v) {
+  return (v.x + v.y + v.z) / 3.0f;
+}
+
 struct DeltaTrackResult {
   bool miss = false;
   float t = 0;
   float null_scatter_factor = 1.0f;
+  float3 f = make_float3(1.0f, 1.0f, 1.0f);
+  float3 pdf = make_float3(1.0f, 1.0f, 1.0f);
+
+  int hit_count = 0;
+  float delta_t = 0.0f;
 };
 
 template <bool force_null_scatter = false>
@@ -297,7 +310,8 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
                 unsigned int &seed,
                 float max_sigma,
                 float sigma_scale,
-                nanovdb::Ray<float> &i_ray) {
+                nanovdb::Ray<float> &i_ray,
+                float3 sigma_scale_spec) {
   DeltaTrackResult res{};
   res.t = i_ray.t0();
   if (i_ray.clip(grid->tree().bbox()) == false) {
@@ -308,16 +322,38 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
   float &t = res.t;
   float &factor = res.null_scatter_factor;
   float last_null_scatter_factor = 1.0f;
+  float3 &f = res.f;
+  float3 &pdf = res.pdf;
+  float3 last_f = make_float3(1.0f, 1.0f, 1.0f);
+  float3 last_pdf = make_float3(1.0f, 1.0f, 1.0f);
 
+  float3 mu_t = sigma_scale_spec * max_sigma;
   while (t < i_ray.t1()) {
     float scaled_max_value = max(max_sigma * sigma_scale, 1e-4);
-    t += sample_free_flight(rnd(seed), scaled_max_value);
+    float dt = sample_free_flight(rnd(seed), scaled_max_value);
+    t += dt;
+
     factor *= last_null_scatter_factor;
 
+    f *= last_f;
+    pdf *= last_pdf;
+
+    res.hit_count++;
+
     auto i_pos = i_ray(t);
-    float sigma = accessor.getValue(nanovdb::Coord::Floor(i_pos)) * sigma_scale;
+    float raw_sigma = accessor.getValue(nanovdb::Coord::Floor(i_pos));
+    float sigma = raw_sigma * sigma_scale;
     float real_scatter_p = sigma / scaled_max_value;
     last_null_scatter_factor = 1.0f - real_scatter_p;
+
+    float3 mu_r = sigma_scale_spec * raw_sigma;
+    float3 mu_n = mu_t - mu_r;
+
+    last_f = mu_n;
+    last_pdf = mu_n;
+    if constexpr (force_null_scatter) {
+      last_pdf = mu_t;
+    }
 
     if constexpr (force_null_scatter) {
       continue;
@@ -325,25 +361,68 @@ delta_track_ray(const nanovdb::FloatGrid *grid,
     if (rnd(seed) > real_scatter_p) {
       continue;
     } else {
+      last_pdf = mu_r;
       break;
     }
   }
 
   if (t >= i_ray.t1()) {
     res.miss = true;
+    t = i_ray.t1();
+    res.hit_count--;
+  } else {
+    // the last real scatter pdf
+    pdf *= last_pdf;
+    f *= mu_t;
   }
+
+  float3 Tr = expf(-(t - i_ray.t0()) * mu_t);
+  pdf *= Tr;
+  f *= Tr;
+
+  res.delta_t = t - i_ray.t0();
 
   return res;
 }
 
+__device__ __forceinline__ float3
+spectral_mis_correction(float sigma_scale,
+                        const float3 &sigma_scale_spec,
+                        float max_value,
+                        float t,
+                        int hit_count) {
+  float factor[3]{};
+  float s[3] = {sigma_scale_spec.x, sigma_scale_spec.y, sigma_scale_spec.z};
+  for (int i = 0; i < 3; i++) {
+    float denorm = 0.0f;
+    for (int j = 0; j < 3; j++) {
+      denorm += powf(s[j] / s[i], float(hit_count)) *
+                expf(-(s[j] - s[i]) * max_value * t);
+    }
+    factor[i] = 3.0f / denorm;
+  }
+
+  // for (int i = 0; i < 3; i++) {
+  //   if (abs(s[i] - sigma_scale) < 1e-3) {
+  //     factor[i] = 1.0f;
+  //   } else {
+  //     factor[i] = 0.0f;
+  //   }
+  // }
+
+  return array_as_float3(factor);
+}
+
 template <RenderMode mode>
-__device__ __forceinline__ float3 render_pixel_delta_tracking(
-    const Scene &scene, int c, int r, float sigma_scale) {
+__device__ __forceinline__ float3
+render_pixel_delta_tracking(const Scene &scene,
+                            int c,
+                            int r,
+                            int spp,
+                            float sigma_scale,
+                            unsigned int &seed) {
   int frame_width = scene.frame_width;
   int frame_height = scene.frame_height;
-  const int index = r * frame_width + c;
-  unsigned int seed = tea<4>(index, 11424);
-  int spp = scene.spp;
   float aspect = float(frame_width) / float(frame_height);
   auto grid = scene.volume_grid;
   float max_value = scene.max_value;
@@ -352,18 +431,34 @@ __device__ __forceinline__ float3 render_pixel_delta_tracking(
                              scene.phase_func.color[2]);
   float3 contrib = make_float3(0.0f, 0.0f, 0.0f);
   auto accessor = grid->tree().getAccessor();
+  float3 sigma_scale_spec = array_as_float3(scene.extinction_scale);
   for (int i = 0; i < spp; i++) {
     float2 jitter = hammersley_sample(i, spp);
     nanovdb::Ray<float> w_ray = sample_camera_ray(scene, c, r, jitter);
     float3 factor = make_float3(1.0f, 1.0f, 1.0f);
+    float3 f = make_float3(1.0f, 1.0f, 1.0f);
+    float3 pdf = make_float3(1.0f, 1.0f, 1.0f);
+    int hit_count = 0;
+    float delta_t = 0;
 
     DeltaTrackResult hit{};
     float last_phase = 1.0f;
     int bounce = 0;
     for (; !hit.miss && bounce < 30; bounce++) {
       nanovdb::Ray<float> i_ray = w_ray.worldToIndexF(*grid);
-      hit = delta_track_ray<false>(
-          grid, accessor, seed, max_value, sigma_scale, i_ray);
+      hit = delta_track_ray<false>(grid,
+                                   accessor,
+                                   seed,
+                                   max_value,
+                                   sigma_scale,
+                                   i_ray,
+                                   sigma_scale_spec);
+      f *= hit.f;
+      pdf *= hit.pdf;
+
+      hit_count += hit.hit_count;
+      delta_t += hit.delta_t;
+
       if (hit.miss) {
         break;
       }
@@ -378,47 +473,77 @@ __device__ __forceinline__ float3 render_pixel_delta_tracking(
                                          next_dir);
       w_ray = nanovdb::Ray<float>(next_origin, float3_as_vec(next_dir));
       factor *= color;
+      f *= color;
 
       if constexpr (mode == RenderMode::RatioTracking ||
-                    mode == RenderMode::MIS) {
+                    mode == RenderMode::MIS ||
+                    mode == RenderMode::SpectralMIS) {
         float3 light_dir;
         float3 light_emission;
         float pe = sample_light(scene, seed, light_dir, light_emission);
         nanovdb::Ray<float> w_light_ray(next_origin,
                                         float3_as_vec(normalize(light_dir)));
         nanovdb::Ray<float> i_light_ray = w_light_ray.worldToIndexF(*grid);
-        auto rt = delta_track_ray<true>(
-            grid, accessor, seed, max_value, sigma_scale, i_light_ray);
+        auto rt = delta_track_ray<true>(grid,
+                                        accessor,
+                                        seed,
+                                        max_value,
+                                        sigma_scale,
+                                        i_light_ray,
+                                        sigma_scale_spec);
         float phase = eval_phase_function(scene.phase_func.diffuse,
                                           scene.phase_func.cos_angle,
                                           curr_dir,
                                           normalize(light_dir));
+
         float3 rt_contrib =
             factor * phase * rt.null_scatter_factor * light_emission / pe;
+        // balance heuristic
+        float w_rt = pe / (pe + rt.null_scatter_factor * phase);
+
         if constexpr (mode == RenderMode::RatioTracking) {
           contrib += rt_contrib;
         }
 
         if constexpr (mode == RenderMode::MIS) {
-          // balance heuristic
-          float w_rt = pe / (pe + rt.null_scatter_factor * phase);
           contrib += rt_contrib * w_rt;
         }
+
+        if constexpr (mode == RenderMode::SpectralMIS) {
+          contrib += rt_contrib * w_rt *
+                     spectral_mis_correction(sigma_scale,
+                                             sigma_scale_spec,
+                                             max_value,
+                                             delta_t + rt.delta_t,
+                                             hit_count + rt.hit_count);
+        }
       }
+
+      f *= last_phase;
+      pdf *= last_phase;
     }
 
     if (hit.miss) {
       if (mode != RenderMode::RatioTracking || bounce == 0) {
         // pure ratio tracking only handles one or more bounces
         float w_dt = 1.0f;
-        if (mode == RenderMode::MIS && bounce != 0) {
+        if ((mode == RenderMode::MIS || mode == RenderMode::SpectralMIS) &&
+            bounce != 0) {
           float pe =
               sample_light_pdf(scene, normalize(vec_as_float3(w_ray.dir())));
           w_dt = hit.null_scatter_factor * last_phase /
                  (pe + hit.null_scatter_factor * last_phase);
         }
-        contrib += w_dt * factor *
-                   get_light_emission(scene, vec_as_float3(w_ray.dir()));
+        float3 light_emission =
+            get_light_emission(scene, vec_as_float3(w_ray.dir()));
+        if constexpr (mode != RenderMode::SpectralMIS) {
+          contrib += w_dt * factor * light_emission;
+        } else {
+          contrib +=
+              w_dt * factor * light_emission *
+              spectral_mis_correction(
+                  sigma_scale, sigma_scale_spec, max_value, delta_t, hit_count);
+        }
       }
     }
   }
@@ -436,7 +561,10 @@ __global__ void render_kernel_delta_tracking(Scene scene, float3 *image) {
   if ((c >= frame_width) || (r >= frame_height))
     return;
 
-  image[index] = render_pixel_delta_tracking<mode>(scene, c, r, 1.0f);
+  unsigned int seed = tea<4>(index, 11424);
+  int spp = scene.spp;
+  image[index] =
+      render_pixel_delta_tracking<mode>(scene, c, r, spp, 1.0f, seed);
 }
 
 template <RenderMode mode>
@@ -450,13 +578,35 @@ __global__ void render_kernel_spectral_seperate(Scene scene, float3 *image) {
   if ((c >= frame_width) || (r >= frame_height))
     return;
 
+  unsigned int seed = tea<4>(index, 11424);
+  int spp = scene.spp;
+
+  auto render_channel = [&](int index) {
+    return render_pixel_delta_tracking<mode>(
+        scene, c, r, spp, scene.extinction_scale[index], seed);
+  };
   image[index] = make_float3(
-      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[0])
-          .x,
-      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[1])
-          .y,
-      render_pixel_delta_tracking<mode>(scene, c, r, scene.extinction_scale[2])
-          .z);
+      render_channel(0).x, render_channel(1).y, render_channel(2).z);
+}
+
+__global__ void render_kernel_spectral_mis(Scene scene, float3 *image) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int frame_width = scene.frame_width;
+  int frame_height = scene.frame_height;
+  const int index = r * frame_width + c;
+
+  if ((c >= frame_width) || (r >= frame_height))
+    return;
+
+  unsigned int seed = tea<4>(index, 11424);
+  int spp = scene.spp;
+  float3 res = make_float3(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < 3; i++) {
+    res += render_pixel_delta_tracking<RenderMode::SpectralMIS>(
+        scene, c, r, spp, scene.extinction_scale[i], seed);
+  }
+  image[index] = res;
 }
 
 template <typename Kernel, typename... Args>
@@ -504,7 +654,7 @@ void render(const Scene &scene, float *d_image) {
     launch(render_kernel_spectral_seperate<RenderMode::MIS>);
     break;
   case RenderMode::SpectralMIS:
-    launch(render_kernel_delta_tracking<RenderMode::SpectralMIS>);
+    launch(render_kernel_spectral_mis);
     break;
   }
 
