@@ -393,22 +393,22 @@ spectral_mis_correction(float sigma_scale,
                         int hit_count) {
   float factor[3]{};
   float s[3] = {sigma_scale_spec.x, sigma_scale_spec.y, sigma_scale_spec.z};
-  for (int i = 0; i < 3; i++) {
-    float denorm = 0.0f;
-    for (int j = 0; j < 3; j++) {
-      denorm += powf(s[j] / s[i], float(hit_count)) *
-                expf(-(s[j] - s[i]) * max_value * t);
-    }
-    factor[i] = 3.0f / denorm;
-  }
-
   // for (int i = 0; i < 3; i++) {
-  //   if (abs(s[i] - sigma_scale) < 1e-3) {
-  //     factor[i] = 1.0f;
-  //   } else {
-  //     factor[i] = 0.0f;
+  //   float denorm = 0.0f;
+  //   for (int j = 0; j < 3; j++) {
+  //     denorm += powf(s[j] / s[i], float(hit_count)) *
+  //               expf(-(s[j] - s[i]) * max_value * t);
   //   }
+  //   factor[i] = 3.0f / denorm;
   // }
+
+  for (int i = 0; i < 3; i++) {
+    if (abs(s[i] - sigma_scale) < 1e-3) {
+      factor[i] = 1.0f;
+    } else {
+      factor[i] = 0.0f;
+    }
+  }
 
   return array_as_float3(factor);
 }
@@ -432,6 +432,7 @@ render_pixel_delta_tracking(const Scene &scene,
   float3 contrib = make_float3(0.0f, 0.0f, 0.0f);
   auto accessor = grid->tree().getAccessor();
   float3 sigma_scale_spec = array_as_float3(scene.extinction_scale);
+  float total_hit_count = 0;
   for (int i = 0; i < spp; i++) {
     float2 jitter = hammersley_sample(i, spp);
     nanovdb::Ray<float> w_ray = sample_camera_ray(scene, c, r, jitter);
@@ -523,6 +524,7 @@ render_pixel_delta_tracking(const Scene &scene,
       pdf *= last_phase;
     }
 
+    total_hit_count += hit_count;
     if (hit.miss) {
       if (mode != RenderMode::RatioTracking || bounce == 0) {
         // pure ratio tracking only handles one or more bounces
@@ -547,6 +549,8 @@ render_pixel_delta_tracking(const Scene &scene,
       }
     }
   }
+  // return make_float3(total_hit_count, total_hit_count, total_hit_count) /
+        //  float(spp);
   return contrib / float(spp);
 }
 
