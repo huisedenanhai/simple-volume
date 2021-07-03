@@ -71,3 +71,5 @@ copy_post_build(volume
 copy_post_build(volume
       "$<TARGET_FILE:IlmBase::Half>")
 
+add_executable(mse mse.cpp)
+target_link_libraries(mse PRIVATE stb)
